@@ -1,104 +1,104 @@
-# Chapter 4: Talking to Claude -- The API Layer
+# 第 4 章：API 層
 
-Chapter 3 established where state lives and how the two tiers communicate. Now we follow what happens when that state is put to use: the system needs to talk to a language model. Everything in Claude Code -- the bootstrap sequence, the state system, the permission framework -- exists to serve this moment.
+第 3 章確立了狀態存放的位置，以及兩層之間如何溝通。現在我們要追蹤狀態被實際運用時發生的事：系統需要與語言模型對話。Claude Code 裡的一切 —— 啟動序列、狀態系統、權限框架 —— 都是為了服務這個時刻而存在。
 
-This layer handles more failure modes than any other part of the system. It must route through four cloud providers via a single transparent interface. It must construct system prompts with byte-level awareness of how the server's prompt cache works, because a single misplaced section can bust a cache worth 50,000+ tokens. It must stream responses with active failure detection, because TCP connections die silently. And it must maintain session-stable invariants so that mid-conversation changes to feature flags do not cause invisible performance cliffs.
+這一層處理的失敗模式比系統中任何其他部分都多。它必須透過單一透明介面，路由到四個雲端供應商。它必須以位元組等級的精準度來構建系統提示詞，因為伺服器端提示詞快取的運作方式，只要一個區段放錯位置，就可能讓一份價值 50,000 多個 token 的快取失效。它必須在串流回應時主動偵測失敗，因為 TCP 連線會無聲地死掉。而且它必須維持工作階段穩定的不變量，才不會因為對話中途切換功能旗標，而造成看不見的效能斷崖。
 
-Let us trace a single API call from start to finish.
+讓我們從頭到尾追蹤一次 API 呼叫。
 
 ```mermaid
 sequenceDiagram
-    participant QL as Query Loop
-    participant CF as Client Factory
-    participant SP as System Prompt Builder
-    participant BH as Beta Headers
-    participant MN as Message Normalizer
+    participant QL as 查詢迴圈
+    participant CF as 客戶端工廠
+    participant SP as 系統提示詞建構器
+    participant BH as Beta 標頭
+    participant MN as 訊息正規化器
     participant API as Claude API
-    participant WD as Watchdog
-    participant RP as Response Processor
+    participant WD as 看門狗
+    participant RP as 回應處理器
 
     QL->>CF: getAnthropicClient()
-    CF->>CF: Provider dispatch + auth
-    CF-->>QL: Authenticated client
+    CF->>CF: 供應商分派 + 驗證
+    CF-->>QL: 已驗證的客戶端
 
-    QL->>SP: Build system prompt
-    SP->>SP: Static sections + BOUNDARY + dynamic sections
-    SP-->>QL: Prompt blocks with cache_control
+    QL->>SP: 建構系統提示詞
+    SP->>SP: 靜態區段 + BOUNDARY + 動態區段
+    SP-->>QL: 帶 cache_control 的提示詞區塊
 
-    QL->>BH: Assemble beta headers
-    BH->>BH: Evaluate sticky latches
-    BH-->>QL: Session-stable header set
+    QL->>BH: 組裝 beta 標頭
+    BH->>BH: 評估黏性閂鎖
+    BH-->>QL: 工作階段穩定的標頭集合
 
-    QL->>MN: Normalize messages
-    MN->>MN: Pair tool_use/result, strip excess media
-    MN-->>QL: Clean message array
+    QL->>MN: 正規化訊息
+    MN->>MN: 配對 tool_use/result、剝除多餘媒體
+    MN-->>QL: 乾淨的訊息陣列
 
-    QL->>API: Stream request
-    API-->>WD: Start idle timer (90s)
-    API-->>RP: SSE events stream back
-    WD-->>WD: Reset timer on each chunk
+    QL->>API: 串流請求
+    API-->>WD: 啟動閒置計時器（90 秒）
+    API-->>RP: SSE 事件串流回來
+    WD-->>WD: 每個 chunk 重設計時器
     RP-->>QL: StreamEvents + AssistantMessage
 ```
 
 ---
 
-## The Multi-Provider Client Factory
+## 多供應商客戶端工廠
 
-The `getAnthropicClient()` function is the single factory for all model communication. It returns an Anthropic SDK client configured for whichever provider the deployment targets:
+`getAnthropicClient()` 函式是所有模型通訊的唯一工廠。它會回傳一個 Anthropic SDK 客戶端，依部署目標所使用的供應商進行設定：
 
 ```mermaid
 graph LR
-    F["getAnthropicClient()"] --> D["Direct API<br/>API key or OAuth"]
-    F --> B["AWS Bedrock<br/>AWS credentials"]
+    F["getAnthropicClient()"] --> D["直連 API<br/>API 金鑰或 OAuth"]
+    F --> B["AWS Bedrock<br/>AWS 憑證"]
     F --> V["Google Vertex AI<br/>Google Auth"]
-    F --> A["Azure Foundry<br/>Azure credentials"]
-    D & B & V & A --> SDK["Anthropic SDK Client"]
+    F --> A["Azure Foundry<br/>Azure 憑證"]
+    D & B & V & A --> SDK["Anthropic SDK 客戶端"]
     SDK --> CL["callModel()"]
 ```
 
-The dispatch is entirely environment-variable driven, evaluated in a fixed priority order. All four provider-specific SDK classes are cast to `Anthropic` via `as unknown as Anthropic`. The comment in the source is refreshingly honest: "we have always been lying about the return type." This deliberate type erasure means every consumer sees a uniform interface. The rest of the codebase never branches on provider.
+分派完全由環境變數驅動，以固定的優先順序評估。四個供應商特定的 SDK 類別全都透過 `as unknown as Anthropic` 被強制轉型為 `Anthropic`。原始碼中的註解誠實得令人耳目一新：「我們一直在對回傳型別說謊。」這種刻意的型別抹除意味著每個消費者都看到統一的介面。其他的程式碼從來不會依供應商分支。
 
-Each provider SDK is dynamically imported -- `AnthropicBedrock`, `AnthropicFoundry`, `AnthropicVertex` are heavy modules with their own dependency trees. The dynamic import ensures unused providers never load.
+每個供應商 SDK 都是動態匯入的 —— `AnthropicBedrock`、`AnthropicFoundry`、`AnthropicVertex` 都是帶有自己依賴樹的沉重模組。動態匯入確保未使用的供應商永遠不會載入。
 
-Provider selection is determined at startup and stored in bootstrap `STATE`. The query loop never checks which provider is active. Switching from Direct API to Bedrock is a configuration change, not a code change.
+供應商的選擇是在啟動時決定，並儲存於啟動 `STATE` 之中。查詢迴圈從不檢查目前啟用的是哪個供應商。從直連 API 切換到 Bedrock 是設定變更，不是程式碼變更。
 
-### The buildFetch Wrapper
+### buildFetch 包裝器
 
-Every outbound fetch gets wrapped to inject an `x-client-request-id` header -- a UUID generated per request. When a request times out, the server never assigns a request ID to the response. Without the client-side ID, the API team cannot correlate the timeout with server-side logs. This header bridges that gap. It is only sent to first-party Anthropic endpoints -- third-party providers might reject unknown headers.
+每個對外的 fetch 都會被包裝，以注入一個 `x-client-request-id` 標頭 —— 每次請求產生的 UUID。當請求逾時時，伺服器永遠不會為回應指派 request ID。沒有客戶端這一側的 ID，API 團隊就無法將逾時事件與伺服器端的日誌關聯起來。這個標頭彌補了這個落差。它只會送到 Anthropic 第一方的端點 —— 第三方供應商可能會拒絕未知的標頭。
 
 ---
 
-## System Prompt Construction
+## 系統提示詞的構建
 
-The system prompt is the most cache-sensitive artifact in the entire system. Claude's API provides server-side prompt caching: identical prompt prefixes across requests can be cached, saving both latency and cost. A 200K-token conversation might have 50-70K tokens that are identical to the previous turn. Busting that cache forces the server to re-process all of it.
+系統提示詞是整個系統中對快取最敏感的產物。Claude 的 API 提供伺服器端提示詞快取：跨請求相同的提示詞前綴可以被快取，同時節省延遲與成本。一個 200K token 的對話可能有 50-70K token 與上一回合完全相同。讓那個快取失效，會迫使伺服器重新處理所有內容。
 
-### The Dynamic Boundary Marker
+### 動態邊界標記
 
-The prompt is built as an array of string sections with a critical dividing line:
+提示詞被建構為一個字串區段的陣列，中間有一條關鍵的分界線：
 
 ```mermaid
 flowchart TD
-    subgraph Static["Static Content (cacheScope: global)"]
+    subgraph Static["靜態內容（cacheScope: global）"]
         direction TB
-        S1["Identity & intro"]
-        S2["System behavior rules"]
-        S3["Doing tasks guidance"]
-        S4["Actions guidance"]
-        S5["Tool usage instructions"]
-        S6["Tone & style"]
-        S7["Output efficiency"]
+        S1["身份與介紹"]
+        S2["系統行為規則"]
+        S3["執行任務的指引"]
+        S4["動作指引"]
+        S5["工具使用指示"]
+        S6["語氣與風格"]
+        S7["輸出效率"]
     end
 
-    B["=== DYNAMIC BOUNDARY ==="]
+    B["=== 動態邊界 ==="]
 
-    subgraph Dynamic["Dynamic Content (per-session)"]
+    subgraph Dynamic["動態內容（每個工作階段）"]
         direction TB
-        D1["Session guidance"]
-        D2["Memory (CLAUDE.md)"]
-        D3["Environment info"]
-        D4["Language preference"]
-        D5["MCP instructions (DANGEROUS: uncached)"]
-        D6["Output style"]
+        D1["工作階段指引"]
+        D2["記憶（CLAUDE.md）"]
+        D3["環境資訊"]
+        D4["語言偏好"]
+        D5["MCP 指示（DANGEROUS：未快取）"]
+        D6["輸出風格"]
     end
 
     Static --> B --> Dynamic
@@ -108,108 +108,108 @@ flowchart TD
     style Dynamic fill:#ddf,stroke:#333
 ```
 
-Everything before the boundary is identical across sessions, users, and organizations -- it gets the highest tier of server-side caching. Everything after contains user-specific content and drops to per-session caching.
+邊界之前的一切跨工作階段、使用者與組織都相同 —— 它享有最高等級的伺服器端快取。邊界之後的一切則包含使用者特定的內容，會降級為每個工作階段的快取。
 
-The naming convention for sections is deliberately loud. Adding a new section requires choosing between `systemPromptSection` (safe, cached) and `DANGEROUS_uncachedSystemPromptSection` (cache-breaking, requires a reason string). The `_reason` parameter is unused at runtime but serves as mandatory documentation -- every cache-breaking section carries its justification in the source code.
+區段的命名慣例刻意很吵。新增一個區段時必須在 `systemPromptSection`（安全、可快取）與 `DANGEROUS_uncachedSystemPromptSection`（會破壞快取，需要理由字串）之間做選擇。`_reason` 參數在執行期不會被使用，但它作為強制性的文件 —— 每個會破壞快取的區段都在原始碼中帶著它的正當理由。
 
-### The 2^N Problem
+### 2^N 問題
 
-A comment in `prompts.ts` explains why conditional sections must go after the boundary:
+`prompts.ts` 中有一段註解解釋了為什麼有條件的區段必須放到邊界之後：
 
-> Each conditional here is a runtime bit that would otherwise multiply the Blake2b prefix hash variants (2^N).
+> 這裡的每個條件都是執行期的一個 bit，否則會讓 Blake2b 前綴雜湊的變體倍增（2^N）。
 
-Every boolean condition before the boundary doubles the number of unique global cache entries. Three conditionals create 8 variants; five create 32. The static sections are deliberately unconditional. Compile-time feature flags (resolved by the bundler) are acceptable before the boundary. Runtime checks (is this Haiku? does the user have auto mode?) must go after.
+邊界之前的每個布林條件，都會讓全域快取的獨特項目數量翻倍。三個條件產生 8 種變體；五個產生 32 種。靜態區段刻意不帶任何條件。編譯期的功能旗標（由打包器解析）在邊界之前是可以接受的。執行期檢查（這是 Haiku 嗎？使用者是否啟用自動模式？）必須放到邊界之後。
 
-This is the kind of constraint that is invisible until you violate it. A well-intentioned engineer adding a user-setting-gated section before the boundary could silently fragment the global cache and double the fleet's prompt processing costs.
-
----
-
-## Streaming
-
-### Raw SSE Over SDK Abstractions
-
-The streaming implementation uses the raw `Stream<BetaRawMessageStreamEvent>` rather than the SDK's higher-level `BetaMessageStream`. The reason: `BetaMessageStream` calls `partialParse()` on every `input_json_delta` event. For tool calls with large JSON inputs (file edits with hundreds of lines), this re-parses the growing JSON string from scratch on every chunk -- O(n^2) behavior. Claude Code handles tool input accumulation itself, so the partial parsing is pure waste.
-
-### The Idle Watchdog
-
-TCP connections can die without notification. The server may crash, a load balancer may silently drop the connection, or a corporate proxy may time out. The SDK's request timeout only covers the initial fetch -- once HTTP 200 arrives, the timeout is satisfied. If the streaming body stops, nothing catches it.
-
-The watchdog: a `setTimeout` that resets on every received chunk. If no chunks arrive for 90 seconds, the stream is aborted and the system falls back to a non-streaming retry. A warning fires at the 45-second mark. When the watchdog fires, it logs the event with the client request ID for correlation.
-
-### Non-Streaming Fallback
-
-When streaming fails mid-response (network error, stall, truncation), the system falls back to a synchronous `messages.create()` call. This handles proxy failures where the proxy returns HTTP 200 with a non-SSE body, or truncates the SSE stream partway through.
-
-The fallback can be disabled when streaming tool execution is active, since a fallback would re-execute the entire request and potentially run tools twice.
+這是那種在你違反之前看不見的限制。一位立意良善的工程師，在邊界之前加入一個受使用者設定控制的區段，可能會無聲地把全域快取碎片化，讓整個機群的提示詞處理成本翻倍。
 
 ---
 
-## Prompt Cache System
+## 串流
 
-### Three Tiers
+### 直接使用原始 SSE，而非 SDK 的抽象
 
-Prompt caching operates at three levels:
+串流實作使用原始的 `Stream<BetaRawMessageStreamEvent>`，而不是 SDK 較高層的 `BetaMessageStream`。原因：`BetaMessageStream` 會在每個 `input_json_delta` 事件上呼叫 `partialParse()`。對於帶有大型 JSON 輸入的工具呼叫（上百行的檔案編輯），這會在每個 chunk 上從頭開始重新解析不斷成長的 JSON 字串 —— O(n^2) 的行為。Claude Code 自己處理工具輸入的累積，所以部分解析完全是浪費。
 
-**Ephemeral cache** (default): Per-session caching with a server-defined TTL (~5 minutes). All users get this.
+### 閒置看門狗
 
-**1-hour TTL**: Eligible users get extended caching. Eligibility is determined by subscription status and latched in bootstrap state -- the `promptCache1hEligible` sticky latch from Chapter 3 ensures a mid-session overage flip does not change the TTL.
+TCP 連線可能在沒有通知的情況下死掉。伺服器可能崩潰、負載平衡器可能無聲地切斷連線，或公司的代理伺服器可能逾時。SDK 的請求逾時只涵蓋最初的 fetch —— 一旦 HTTP 200 抵達，逾時就算滿足了。如果串流的本體停下來，沒有東西會察覺。
 
-**Global scope**: System prompt cache entries get cross-session, cross-organization sharing. The static portions of the prompt are identical for all Claude Code users, so a single cached copy serves everyone. Global scope is disabled when MCP tools are present, because MCP tool definitions are user-specific and would fragment the cache into millions of unique prefixes.
+看門狗的做法：一個 `setTimeout`，每收到一個 chunk 就重設一次。如果 90 秒內沒有 chunk 到達，串流就會被中止，系統會退回到非串流的重試。45 秒的時間點會觸發一則警告。當看門狗觸發時，會連同 client request ID 一起記錄事件以便關聯。
 
-### The Sticky Latches in Action
+### 非串流後備
 
-The five sticky latches from Chapter 3 are evaluated here, during request construction. Each latch starts as `null` and, once set to `true`, remains `true` for the session. The comment above the latch block is precise: "Sticky-on latches for dynamic beta headers. Each header, once first sent, keeps being sent for the rest of the session so mid-session toggles don't change the server-side cache key and bust ~50-70K tokens."
+當串流在回應中途失敗時（網路錯誤、停滯、截斷），系統會退回到同步的 `messages.create()` 呼叫。這能處理代理伺服器回傳 HTTP 200 卻帶著非 SSE 本體的情況，或者 SSE 串流在中途被截斷的情況。
 
-See Chapter 3, Section 3.1 for the full explanation of the latch pattern, the five specific latches, and why always-send-all-headers is not the right solution.
-
----
-
-## The queryModel Generator
-
-The `queryModel()` function is an async generator (~700 lines) that orchestrates the entire API call lifecycle. It yields `StreamEvent`, `AssistantMessage`, and `SystemAPIErrorMessage` objects.
-
-The request assembly follows a carefully ordered sequence:
-
-1. **Kill switch check** -- safety valve for the most expensive model tier
-2. **Beta header assembly** -- model-specific, with sticky latches applied
-3. **Tool schema building** -- parallel via `Promise.all()`, deferred tools excluded until discovered
-4. **Message normalization** -- repair orphaned tool_use/tool_result mismatches, strip excess media, remove stale blocks
-5. **System prompt block construction** -- split at the dynamic boundary, assign cache scopes
-6. **Retry-wrapped streaming** -- handles 529 (overloaded), model fallback, thinking downgrade, OAuth refresh
-
-### Output Token Cap
-
-The default output cap is 8,000 tokens, not the typical 32K or 64K. Production data showed that p99 output is 4,911 tokens -- standard limits over-reserve by 8-16x. When a response hits the cap (<1% of requests), it gets one clean retry at 64K. This saves significant cost at fleet scale.
-
-### Error Handling and Retry
-
-The `withRetry()` function is itself an async generator that yields `SystemAPIErrorMessage` events so the UI can display retry status. Retry strategies:
-
-- **529 (overloaded)**: Wait and retry, optionally downgrading fast mode
-- **Model fallback**: Primary model fails, try a fallback (e.g., Opus to Sonnet)
-- **Thinking downgrade**: Context window overflow triggers reduced thinking budget
-- **OAuth 401**: Refresh token and retry once
-
-The generator pattern means retry progress ("Server overloaded, retrying in 5s...") appears as a natural part of the event stream, not as a side-channel notification.
+當串流工具執行處於啟用狀態時，後備機制可以被停用，因為後備會重新執行整個請求，有可能讓工具執行兩次。
 
 ---
 
-## Apply This
+## 提示詞快取系統
 
-**Treat prompt caching as an architectural constraint, not a feature toggle.** Most LLM applications "turn on" caching. Claude Code treats it as a design constraint that shapes prompt ordering, section memoization, header latching, and configuration management. The difference between a well-structured prompt (cache hit on 50K tokens) and a poorly-structured one (full reprocessing every turn) is the single largest cost lever in the system.
+### 三個層級
 
-**Use the DANGEROUS naming convention for costly escape hatches.** When a codebase has an invariant that is easy to violate accidentally, naming the escape hatch with a loud prefix does three things: makes violations visible in code review, forces documentation (the required reason parameter), and creates psychological friction toward the safe default. This generalizes beyond caching to any operation with invisible cost.
+提示詞快取在三個層級上運作：
 
-**Build streaming with a watchdog, not just a timeout.** The SDK's request timeout satisfies on HTTP 200, but the response body can stop arriving at any point. A `setTimeout` that resets on every chunk catches this. The non-streaming fallback handles proxy failure modes (HTTP 200 with non-SSE body, mid-stream truncation) that are more common than you expect in corporate environments.
+**短暫快取**（預設）：每個工作階段的快取，具有伺服器定義的 TTL（約 5 分鐘）。所有使用者都能獲得。
 
-**Make retry strategies yield-based, not exception-based.** By making the retry wrapper an async generator that yields status events, the caller displays retry progress as a natural part of the event stream. The model fallback pattern (Opus fails, try Sonnet) is particularly useful for production resilience.
+**1 小時 TTL**：符合資格的使用者能取得延長快取。資格由訂閱狀態決定，並在啟動狀態中被閂鎖 —— 第 3 章提到的 `promptCache1hEligible` 黏性閂鎖確保工作階段中途的超額翻轉不會改變 TTL。
 
-**Separate the fast path from the full pipeline.** Not every API call needs tool search, advisor integration, thinking budgets, and streaming infrastructure. Claude Code's `queryHaiku()` function provides a streamlined path for internal operations (compaction, classification) that skips all agentic concerns. A separate function with a simplified interface prevents accidental complexity leakage.
+**全域範圍**：系統提示詞快取項目取得跨工作階段、跨組織的共享。提示詞的靜態部分對所有 Claude Code 使用者都相同，因此單一快取副本就能服務所有人。當存在 MCP 工具時全域範圍會被停用，因為 MCP 工具定義是使用者特定的，會把快取碎片化為數百萬個獨特前綴。
+
+### 黏性閂鎖的實際運作
+
+第 3 章那五個黏性閂鎖會在這裡、在請求構建期間被評估。每個閂鎖一開始是 `null`，一旦被設為 `true`，整個工作階段都會保持 `true`。閂鎖區塊上方的註解說得很精準：「動態 beta 標頭的黏性開啟閂鎖。每個標頭一旦首次被送出，就會在工作階段的其餘時間持續被送出，這樣工作階段中途的切換就不會改變伺服器端的快取鍵，也就不會讓約 50-70K 個 token 的快取失效。」
+
+關於閂鎖模式的完整解釋、五個具體的閂鎖，以及為什麼「永遠送出所有標頭」不是正確的解法，請參閱第 3 章第 3.1 節。
 
 ---
 
-## Looking Ahead
+## queryModel 產生器
 
-The API layer sits at the foundation of everything that follows. Chapter 5 will show how the query loop uses the streaming response to drive tool execution -- including how tools begin executing before the model finishes its response. Chapter 6 will explain how the compaction system preserves cache efficiency when conversations approach the context limit. Chapter 7 will show how each agent thread gets its own message array and request chain.
+`queryModel()` 函式是一個非同步產生器（約 700 行），負責協調整個 API 呼叫的生命週期。它會產出 `StreamEvent`、`AssistantMessage` 以及 `SystemAPIErrorMessage` 物件。
 
-All of those systems inherit the constraints established here: cache stability as an architectural invariant, provider transparency through the client factory, and session-stable configuration through the latch system. The API layer does not just send requests -- it defines the rules by which every other system operates.
+請求的組裝遵循一個精心安排的順序：
+
+1. **Kill switch 檢查** —— 針對最昂貴模型層級的安全閥
+2. **Beta 標頭組裝** —— 視模型而定，並套用黏性閂鎖
+3. **工具 schema 建構** —— 透過 `Promise.all()` 平行進行，延後的工具會被排除，直到被發現為止
+4. **訊息正規化** —— 修復孤立的 tool_use/tool_result 不匹配、剝除多餘媒體、移除過時區塊
+5. **系統提示詞區塊構建** —— 在動態邊界處分割，指派快取範圍
+6. **包裝重試的串流** —— 處理 529（過載）、模型後備、thinking 降級、OAuth 重新整理
+
+### 輸出 token 上限
+
+預設的輸出上限是 8,000 個 token，而不是常見的 32K 或 64K。正式環境的資料顯示 p99 輸出是 4,911 個 token —— 標準上限過度預留了 8-16 倍。當回應碰到上限時（少於 1% 的請求），會在 64K 下乾淨地重試一次。這在整個機群的規模下節省了可觀的成本。
+
+### 錯誤處理與重試
+
+`withRetry()` 函式本身是一個非同步產生器，會產出 `SystemAPIErrorMessage` 事件，讓 UI 可以顯示重試狀態。重試策略：
+
+- **529（過載）**：等待後重試，必要時降級 fast mode
+- **模型後備**：主要模型失敗時，嘗試後備模型（例如 Opus 降到 Sonnet）
+- **Thinking 降級**：上下文視窗溢位時觸發較小的思考預算
+- **OAuth 401**：重新整理 token 並重試一次
+
+產生器模式意味著重試進度（「伺服器過載，5 秒後重試...」）會以事件串流中自然的一部分出現，而不是透過側通道通知。
+
+---
+
+## 實務應用
+
+**把提示詞快取當成架構性的限制，而不是功能開關。** 多數 LLM 應用「開啟」快取。Claude Code 把它當成一個會塑造提示詞排序、區段記憶化、標頭閂鎖與設定管理的設計限制。結構良好的提示詞（命中 50K token 的快取）與結構不良的提示詞（每一回合都重新處理全部內容）之間的差異，是系統中單一最大的成本槓桿。
+
+**為昂貴的緊急出口採用 DANGEROUS 命名慣例。** 當一個程式碼庫有一個容易不小心違反的不變量時，以吵鬧的前綴命名緊急出口會做三件事：讓違反在程式碼審查中可見、強制文件化（那個必要的理由參數），並對安全預設產生心理摩擦。這可以推廣到快取之外，任何具有隱形成本的操作都適用。
+
+**用看門狗而非單純的逾時來建構串流。** SDK 的請求逾時在 HTTP 200 時就滿足了，但回應本體可能在任何時刻停止抵達。一個在每個 chunk 上都重設的 `setTimeout` 能抓到這種情況。非串流後備機制處理的是企業環境中比你預期更常見的代理伺服器失敗模式（HTTP 200 卻帶著非 SSE 本體、串流中途截斷）。
+
+**讓重試策略以產出為基礎，而不是以例外為基礎。** 把重試包裝器做成一個會產出狀態事件的非同步產生器，呼叫者就能把重試進度以事件串流中自然的一部分來呈現。模型後備模式（Opus 失敗就試 Sonnet）對正式環境的韌性特別有用。
+
+**把快速路徑與完整的管線分開。** 不是每個 API 呼叫都需要工具搜尋、advisor 整合、思考預算與串流基礎設施。Claude Code 的 `queryHaiku()` 函式為內部操作（壓縮、分類）提供了一條精簡路徑，跳過所有與 agentic 相關的顧慮。一個帶有簡化介面的獨立函式能防止複雜性意外滲漏。
+
+---
+
+## 前瞻
+
+API 層坐落在後續一切的基礎之上。第 5 章將展示查詢迴圈如何利用串流回應來驅動工具執行 —— 包括工具如何在模型完成其回應之前就開始執行。第 6 章將解釋壓縮系統在對話接近上下文上限時如何保持快取效率。第 7 章將展示每個 agent 執行緒如何擁有自己的訊息陣列與請求鏈。
+
+這些系統全都繼承了這裡所確立的限制：把快取穩定性當作架構不變量、透過客戶端工廠達成的供應商透明度，以及透過閂鎖系統達成的工作階段穩定設定。API 層不只是送出請求 —— 它定義了其他每個系統賴以運作的規則。
